@@ -387,34 +387,42 @@ print('   True best medicine        :', true_best,
 ### Analysis Questions & Comparative Summary
 
 Questions 1-3 are answered by the computed cell above (so they always match this run).
-The discussion below interprets those results.
+The discussion below interprets those results for **G = 178**.
 
 **1. Highest cumulative reward at 1000 patients?**
-See `Q1` above. The strategies that quickly lock onto the true best medicine
-(medicine 1, P = 0.75) and then exploit it - typically UCB1 and Epsilon-Greedy (10%) -
-accumulate the most reward, while Epsilon-Greedy (50%) loses reward to constant random
-exploration.
+See `Q1` above - for this run it is **Greedy (~520)**. With a clean round-robin warm-up
+(10 pulls each) the true best medicine (medicine 1, P = 0.75) stands out clearly, so Greedy
+locks onto it and then spends *every* remaining patient exploiting it - wasting nothing on
+exploration. Epsilon-Greedy (10%) is a close second; Epsilon-Greedy (50%) is lowest because
+it keeps prescribing random (often inferior) medicines.
 
 **2. Fastest convergence?**
-See `Q2` above. UCB1 usually converges earliest because its confidence bonus forces it to
-disambiguate the arms early and then commit, without relying on random luck.
+See `Q2` above - here it is **Epsilon-Greedy (50%)**, with **UCB1** essentially tied.
+Heavy/structured exploration samples every arm very early, so the running best-estimated
+medicine settles quickly. (Convergence = earliest patient after which the estimated-best
+arm no longer changes.)
 
 **3. Most stable performance?**
-See `Q3` above. Greedy and UCB1 are the most stable once they commit (smooth, near-linear
-curve); Epsilon-Greedy (50%) fluctuates the most.
+See `Q3` above - **Greedy** is the most stable: once it commits to a single medicine the
+only remaining variation is that medicine's intrinsic Bernoulli/severity noise, giving the
+smoothest curve. Epsilon-Greedy (50%) fluctuates the most due to constant random switching.
 
 **4. Safest approach for real-world hospital deployment?**
-**UCB1.** It is deterministic (no random prescriptions), gives principled extra chances
-to under-tested treatments, converges quickly, and offers confidence-based justification
-for each choice - all valuable when patient safety matters.
+**UCB1.** It is deterministic (no random prescriptions on real patients), gives principled
+extra chances to under-tested treatments, converges quickly, and offers a confidence-based
+justification for every choice - all valuable when patient safety matters. (Pure Greedy
+"won" on reward here only because of a lucky, clean warm-up; on a different seed a poor
+warm-up can permanently lock it onto a sub-optimal medicine, which is unacceptable
+clinically.)
 
 **Comparative summary.**
-Pure Greedy is efficient but risky: a poor warm-up can lock it onto a sub-optimal
-medicine permanently (note how its convergence point and final medicine in the table can
-differ from the true best). Epsilon-Greedy adds exploration; 10% performs well, 1% can get
-stuck, and 50% wastes too many patients on inferior medicines. UCB1 gives the best balance
-- fast, stable convergence to the true best medicine while still evaluating every
-treatment fairly - making it the recommended choice for this clinical setting.
+On this dataset Greedy achieves the highest cumulative reward and the most stable curve
+because the warm-up cleanly identifies medicine 1 and it then exploits without waste.
+Epsilon-Greedy trades a little reward for robustness: 10% performs well, 1% risks getting
+stuck, and 50% wastes too many patients on inferior medicines. UCB1 converges early and
+evaluates every treatment fairly; although its raw reward is slightly lower here, its
+determinism and built-in confidence guarantees make it the recommended, safest choice for
+a real clinical setting.
 """),
 ]
 
@@ -472,6 +480,12 @@ from a `G`-seeded shuffle of all other cells.
 > The assignment specifies counts for rescue/charging/danger/blocked cells but not for
 > wind zones, so we add **2 wind zones** (documented assumption) to exercise the
 > stochastic-transition logic.
+>
+> The `+5` "reach charging station" reward is treated as a **one-time discovery bonus per
+> station** (the battery still refills on every visit). Without this, repeatedly stepping
+> onto a charger would form an infinite positive-reward loop and the optimal policy would
+> farm the charger forever instead of rescuing - so a per-station "discovered" flag is
+> added to the state (documented assumption, analogous to a rescue target paying out once).
 """),
     code(r"""
 import time
@@ -517,6 +531,8 @@ blocked_set  = set(blocked_cells)
 wind_set     = set(wind_cells)
 # Map each rescue-target cell to its index in the rescued-status tuple
 target_index = {cell: i for i, cell in enumerate(rescue_targets)}
+# Map each charging cell to its index in the charged-status tuple (one-time +5 bonus)
+charge_index = {cell: i for i, cell in enumerate(charging_cells)}
 
 START = (0, 0)
 GAMMA = 0.95                              # discount factor
@@ -563,7 +579,7 @@ def valid_actions(state):
     # Return all valid actions from a state. Hover is always valid; a movement is
     # valid only if the adjacent cell is on the grid (moving into a blocked cell is
     # allowed but keeps the drone in place).
-    r, c, b, resc = state
+    r, c, b, resc, chg = state
     acts = ['Hover']
     for d in MOVES:
         dr, dc = DELTA[d]
@@ -580,16 +596,22 @@ for r in range(N):
     md(r"""
 ### State representation & transition dynamics
 
-**State** `s = (row, col, battery, rescued)` where `rescued` is a tuple of booleans, one
-per rescue target. This captures the drone position, remaining battery, and which targets
-are still pending - the minimal information needed for the Markov property.
+**State** `s = (row, col, battery, rescued, charged)` where `rescued` is a tuple of
+booleans (one per rescue target) and `charged` is a tuple of booleans (one per charging
+station, marking whether its one-time `+5` bonus has already been paid). This captures the
+drone position, remaining battery, which targets are still pending, and which chargers are
+already discovered - the information needed for the Markov property.
 
 **Rewards** (mutually exclusive per step, matching the assignment table):
-rescue target `+20`, danger zone `-10`, charging station `+5`, regular movement `-1`,
-battery exhausted `-20` (added when battery hits 0).
+rescue target `+20`, danger zone `-10`, charging station `+5` (first visit only),
+regular movement `-1`, battery exhausted `-20` (added when battery hits 0).
 
 **Battery:** every action costs 1 unit; entering a charging station refills to full;
 hovering on a charging station adds `+2` (capped at max); battery `0` ends the episode.
+
+**Blocked / off-grid moves:** if a movement would leave the grid or enter a blocked cell
+the drone stays put and the step counts as a regular move (`-1`, battery `-1`); it does
+**not** re-collect the current cell's entry reward.
 
 **Wind:** when the drone is on a wind cell and chooses a movement, with probability
 `WIND_P` the realised direction is replaced by a uniform random one of the four moves
@@ -599,7 +621,7 @@ hovering on a charging station adds `+2` (capped at max); battery `0` ends the e
 def transitions(state, action):
     # Return the list of (probability, next_state, reward, done) tuples for taking
     # `action` in `state`. Assumes `state` is non-terminal.
-    r, c, b, resc = state
+    r, c, b, resc, chg = state
     out = defaultdict(float)              # accumulate probability over identical outcomes
 
     def add(p, nstate, reward, done):
@@ -609,12 +631,12 @@ def transitions(state, action):
     if action == 'Hover':
         if (r, c) in charging_set:        # hovering on a charger adds +2 battery
             nb = min(MAX_BATTERY, b + 2)
-            add(1.0, (r, c, nb, resc), 0.0, False)
+            add(1.0, (r, c, nb, resc, chg), 0.0, False)
         else:                             # hovering elsewhere costs 1 battery like a move
             nb = b - 1
             done = (nb == 0)
             reward = -1 + (-20 if done else 0)
-            add(1.0, (r, c, nb, resc), reward, done)
+            add(1.0, (r, c, nb, resc, chg), reward, done)
         return [(p, ns, rew, dn) for (ns, rew, dn), p in out.items()]
 
     # ---------- MOVEMENT (with optional wind disturbance) ----------
@@ -630,11 +652,22 @@ def transitions(state, action):
         nr, nc = move_cell(r, c, d)       # resolve movement (handles walls/blocked)
         nb = b - 1                        # movement consumes 1 battery
         resc2 = list(resc)
+        chg2 = list(chg)
         cell = (nr, nc)
         # Mutually-exclusive event reward for the entered cell
-        if cell in charging_set:
-            reward = 5
-            nb = MAX_BATTERY              # charging refills battery to full
+        if (nr, nc) == (r, c):
+            # Move blocked / off-grid: the drone stays put. Per the assignment this only
+            # consumes battery as a regular move - it must NOT re-trigger the current
+            # cell's entry reward (e.g. re-charging by bumping a wall while on a charger).
+            reward = -1
+        elif cell in charging_set:
+            nb = MAX_BATTERY             # charging always refills battery to full
+            ci = charge_index[cell]
+            if not chg[ci]:              # +5 incentive paid only the FIRST time a station
+                reward = 5               # is reached (one-time, like a rescue target);
+                chg2[ci] = True          # mark this charger as already discovered
+            else:
+                reward = 0               # revisiting a known charger: refill only, no bonus
         elif cell in danger_set:
             reward = -10                 # danger penalty (does NOT terminate)
         elif cell in target_index and not resc[target_index[cell]]:
@@ -647,9 +680,10 @@ def transitions(state, action):
             reward += -20
             done = True
         resc2 = tuple(resc2)
+        chg2 = tuple(chg2)
         if all(resc2):                   # all targets rescued -> terminal (success)
             done = True
-        add(p, (nr, nc, nb, resc2), reward, done)
+        add(p, (nr, nc, nb, resc2, chg2), reward, done)
 
     return [(p, ns, rew, dn) for (ns, rew, dn), p in out.items()]
 """),
@@ -660,15 +694,17 @@ class DroneRescueEnv:
         self.reset()
 
     def reset(self):
-        # Start at the top-left corner with a full battery and no targets rescued.
+        # Start at the top-left corner with a full battery, no targets rescued and
+        # no charging stations discovered yet.
         self.r, self.c = START
         self.b = MAX_BATTERY
         self.resc = tuple([False] * n_targets)
+        self.chg = tuple([False] * n_charge)
         self.steps = 0
         return self.state()
 
     def state(self):
-        return (self.r, self.c, self.b, self.resc)
+        return (self.r, self.c, self.b, self.resc, self.chg)
 
     def step(self, action):
         # Sample one outcome from the transition distribution of the current state.
@@ -682,7 +718,7 @@ class DroneRescueEnv:
                 chosen = (p, ns, rew, done)
                 break
         _, ns, reward, done = chosen
-        self.r, self.c, self.b, self.resc = ns
+        self.r, self.c, self.b, self.resc, self.chg = ns
         self.steps += 1
         if self.steps >= MAX_STEPS:       # enforce the episode step cap
             done = True
@@ -723,12 +759,17 @@ runtime, and the final delta.
     code(r"""
 def enumerate_states():
     # Enumerate every non-terminal state: a non-blocked position, battery in 1..MAX,
-    # and any rescued-status combination that is not "all rescued" (terminal).
+    # any rescued-status combination that is not "all rescued" (terminal), and any
+    # charging-discovered combination (which chargers have already paid their +5 bonus).
     states = []
     rescued_combos = []
     for mask in range(2 ** n_targets):    # all subsets of rescued targets
         combo = tuple(bool(mask & (1 << i)) for i in range(n_targets))
         rescued_combos.append(combo)
+    charged_combos = []
+    for mask in range(2 ** n_charge):     # all subsets of already-discovered chargers
+        combo = tuple(bool(mask & (1 << i)) for i in range(n_charge))
+        charged_combos.append(combo)
     for r in range(N):
         for c in range(N):
             if (r, c) in blocked_set:     # drone can never occupy a blocked cell
@@ -737,7 +778,8 @@ def enumerate_states():
                 for combo in rescued_combos:
                     if all(combo):        # all-rescued is terminal -> excluded
                         continue
-                    states.append((r, c, b, combo))
+                    for ccombo in charged_combos:
+                        states.append((r, c, b, combo, ccombo))
     return states
 
 all_states = enumerate_states()
@@ -790,8 +832,9 @@ def greedy_policy(V, gamma=GAMMA):
     return policy
 
 pi_star = greedy_policy(V_star)
-# Show the optimal action from the start state with a full battery, nothing rescued
-start_state = (0, 0, MAX_BATTERY, tuple([False] * n_targets))
+# Show the optimal action from the start state: full battery, nothing rescued,
+# no chargers discovered yet.
+start_state = (0, 0, MAX_BATTERY, tuple([False] * n_targets), tuple([False] * n_charge))
 print('Optimal action at start state', start_state, '->', pi_star[start_state])
 print(f'V*(start) = {V_star[start_state]:.3f}')
 """),
@@ -805,6 +848,7 @@ each cell as an arrow (movements) or a dot (hover), overlaid on the labelled gri
 # Arrow vectors for plotting movement directions (note: image y-axis points down)
 ARROW = {'Up': (0, 0.3), 'Down': (0, -0.3), 'Left': (-0.3, 0), 'Right': (0.3, 0)}
 fixed_resc = tuple([False] * n_targets)
+fixed_chg = tuple([False] * n_charge)
 fixed_batt = MAX_BATTERY
 
 fig, ax = plt.subplots(figsize=(7, 7))
@@ -820,7 +864,7 @@ for r in range(N):
                 fontsize=10, fontweight='bold')
         if sym == 'X':                      # no policy arrow on blocked cells
             continue
-        s = (r, c, fixed_batt, fixed_resc)
+        s = (r, c, fixed_batt, fixed_resc, fixed_chg)
         a = pi_star.get(s)
         if a == 'Hover':
             ax.plot(c, N - 1 - r, 'ko', markersize=5)   # dot = hover
@@ -850,7 +894,7 @@ for r in range(N):
     for c in range(N):
         if (r, c) in blocked_set:
             continue
-        value_grid[r, c] = V_star[(r, c, fixed_batt, fixed_resc)]
+        value_grid[r, c] = V_star[(r, c, fixed_batt, fixed_resc, fixed_chg)]
 
 fig, ax = plt.subplots(figsize=(7, 6))
 im = ax.imshow(value_grid, cmap='viridis')
@@ -874,8 +918,8 @@ print('value high by protecting against battery exhaustion, and blocked cells ar
 ## 5. DP Scalability Discussion (1 Mark)
 
 **Curse of Dimensionality.** The state space is the product of all state variables:
-`positions x battery levels x 2^(#targets)`. For our 6x6 grid this is roughly
-`33 x 10 x 2^3` states. Each variable we add multiplies the size.
+`positions x battery levels x 2^(#targets) x 2^(#chargers)`. For our 6x6 grid this is
+roughly `33 x 10 x 2^3 x 2^2` states. Each variable we add multiplies the size.
 
 **How the state space grows:**
 - **10x10 grid:** positions jump from ~33 to ~100, roughly **3x** more states (and the
